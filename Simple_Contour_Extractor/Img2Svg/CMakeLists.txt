@@ -10,6 +10,11 @@ set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_Fortran_STANDARD 2018)
 
+file(MAKE_DIRECTORY "${CMAKE_SOURCE_DIR}/bin")
+file(MAKE_DIRECTORY "${CMAKE_SOURCE_DIR}/output")
+
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin")
+
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE
       "Debug"
@@ -17,7 +22,5 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 add_subdirectory(src/img2csv)
-
-# add_subdirectory(src/csv2json)
-
+add_subdirectory(src/csv2json)
 # add_subdirectory(src/json2svg)
