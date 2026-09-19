@@ -23,4 +23,4 @@ endif()
 
 add_subdirectory(src/img2csv)
 add_subdirectory(src/csv2json)
-# add_subdirectory(src/json2svg)
+add_subdirectory(src/json2svg)

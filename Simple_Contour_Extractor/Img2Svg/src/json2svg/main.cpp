@@ -1,63 +1,87 @@
-// src/json2svg/main.cpp
-//
-// Etapa 3 (C++): Base para o SVG
-//
-// Responsabilidade: ler o JSON de contornos, simplificar cada contorno com Ramer-Douglas-Peucker
-// e escrever um SVG final usando SOMENTE comandos de linha ("L") no path, sem ajuste de curvas de Bezier.
-//
-// Schema do JSON de contornos (formato específico do projeto)
-//
-// {
-//     "width": 800,
-//     "height": 600,
-//     "edges": [
-//        { "id": 1, "pontos": [ { "x": 10, "y": 15 }, { "x": 11, "y": 15 } ] }
-//     ]
-// }
-//
-// Regras:
-// - `width` e `height`: inteiros, dimensões da imagem original.
-// - `edges`: lista de objetos, cada um com:
-// - `id`: inteiro, identificador do contorno (resultado do edge linking).
-// - `points`: lista ORDENADA de `{x, y}` (inteiros), na ordem em que o
-//    contorno é percorrido. A ordem importa para o RDP e para a geração do path SVG.
-//
-// Entrada: Json específico
-// Saída: SVG de contornos
-//
-// Exit codes: 0 = OK, 1 = runtime error, 2 = usage error.
+/*
+ * src/json2svg/main.cpp
+ *
+ * Step 3 (C++): SVG Base
+ *
+ * Objective: read the contours JSON, simplify each contour using Ramer-Douglas-Peucker,
+ * and write a final SVG using ONLY line commands ("L") in the path, without Bezier curve fitting.
+ *
+ * Input:  JSON file
+ * Output: SVG file (a missing ".svg" extension is appended)
+ *
+ * JSON Schema:
+ * {
+ *   "width": 800,
+ *   "height": 600,
+ *   "edges": [
+ *       { "id": 1, "points": [ { "x": 10, "y": 15 }, { "x": 11, "y": 15 } ] }
+ *   ]
+ * }
+ *
+ * Rules:
+ *   width and height: integers, dimensions of the original image
+ *   edges: list of objects, each with:
+ *     id: integer, contour identifier (result of edge linking)
+ *     points: ORDERED list of `{x, y}` (integers, 0-based), in the order in which the
+ *             contour is traversed (consecutive points are 8-neighbours).
+ *
+ * SVG: points are drawn at pixel centres (+0.5) so the SVG lines up with the source image.
+ * A contour whose ends touch is closed with "Z"; an open one is left open.
+ *
+ * Exit codes: 0 = OK, 1 = runtime error, 2 = usage error.
+ *
+ * Build: g++ -std=c++2b -O2 -D_GLIBCXX_ASSERTIONS -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+ *            main.cpp -o json2svg
+ *        (for tests, add: -g -fsanitize=address,undefined)
+ */
 
+#include <algorithm>
+#include <cctype>
+#include <charconv>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <iterator>
 #include <print>
+#include <span>
+#include <stdexcept>
+#include <string>
 #include <string_view>
+#include <system_error>
+#include <utility>
 #include <vector>
+
+namespace fs = std::filesystem;
 
 namespace {
 
 template <typename T>
 using Result = std::expected<T, std::string>;
 
-constexpr std::string_view DEFAULT_OUTPUT = "data/output/step3.svg";
-
-void usage()
-{
-    std::string program = "json2svg";
-    std::println("Usage: {} -i <input_path> [-o <output_path>]\n"
-                 "Options:\n"
-                 "  -h, --help           Print this help message and exit\n"
-                 "  -i, --input <path>   Path to the input JSON file (required)\n"
-                 "  -o, --output <path>  Path to the output SVG file (default: {})\n",
-                 program, DEFAULT_OUTPUT);
-}
+constexpr double DEFAULT_EPSILON = 1.0;
+constexpr std::uintmax_t MAX_FILE_BYTES = 256ULL * 1024 * 1024;
 
 struct Options {
-    std::filesystem::path input;
-    std::filesystem::path output{DEFAULT_OUTPUT};
+    fs::path input;
+    fs::path output;
+    double epsilon = DEFAULT_EPSILON;
     bool help = false;
 };
+
+void usage(std::FILE *out)
+{
+    std::println(out, "Usage: json2svg -i <input_path> -o <output_path> [-e <epsilon>]\n"
+                      "Options:\n"
+                      "  -h, --help                Print this help message and exit\n"
+                      "  -i, --input <path>        Path to the input JSON file (required)\n"
+                      "  -o, --output <path>       Path to the output SVG file (required)\n"
+                      "  -e, --epsilon <n>         Ramer-Douglas-Peucker tolerance in pixels, >= 0 (default: {})",
+                 DEFAULT_EPSILON);
+}
 
 auto parse_args(std::span<const char *const> args) -> Result<Options>
 {
@@ -73,8 +97,9 @@ auto parse_args(std::span<const char *const> args) -> Result<Options>
 
         const bool is_input = arg == "-i" || arg == "--input";
         const bool is_output = arg == "-o" || arg == "--output";
+        const bool is_epsilon = arg == "-e" || arg == "--epsilon";
 
-        if (!is_input && !is_output) {
+        if (!is_input && !is_output && !is_epsilon) {
             return std::unexpected(std::format("unknown argument '{}'", arg));
         }
         if (++i >= args.size()) {
@@ -89,190 +114,427 @@ auto parse_args(std::span<const char *const> args) -> Result<Options>
             opts.output = value;
         }
         else {
-            return std::unexpected(std::format("invalid value '{}' for option '{}'", value, arg));
+            const char *end = value.data() + value.size();
+            const auto [ptr, ec] = std::from_chars(value.data(), end, opts.epsilon);
+            if (ec != std::errc{} || ptr != end || !std::isfinite(opts.epsilon) || opts.epsilon < 0.0) {
+                return std::unexpected(std::format("invalid value '{}' for option '{}'", value, arg));
+            }
         }
     }
 
     if (opts.input.empty()) {
         return std::unexpected("option '-i,--input' is required");
     }
+    if (opts.output.empty()) {
+        return std::unexpected("option '-o,--output' is required");
+    }
+    if (!opts.output.has_filename()) {
+        return std::unexpected(std::format("output path '{}' has no file name", opts.output.string()));
+    }
     return opts;
 }
 
 struct Point { double x; double y; };
-struct Contour { int id; std::vector<Point> points; };
+struct Contour { int id = 0; std::vector<Point> points; };
+struct Drawing { int width = 0; int height = 0; std::vector<Contour> contours; };
 
-struct JsonImage {
-    int width = 0;
-    int height = 0;
-    std::vector<Contour> contours;
-};
+// JSON input
 
-auto validate_extension(const std::filesystem::path &path, const std::string_view extension) -> bool
+// Untrusted text is echoed in error messages: keep it short and free of control characters.
+auto printable(std::string_view text) -> std::string
 {
-    const std::string ext = path.extension().string();
-    return std::ranges::equal(ext, extension, [](unsigned char a, unsigned char b) {
-        return std::tolower(a) == std::tolower(b);
-    });
-}
-
-auto load_json(const std::filesystem::path &path) -> Result<JsonImage> {
-    std::ifstream file(path);
-    if (!file.is_open()) {
-        return std::unexpected(std::format("failed to open input json file '{}'", path.string()));
-    }
-
-    std::ostringstream buffer;
-    buffer << file.rdbuf();
-    std::string content = buffer.str();
-
-    JsonImage img;
-
-    // TO DO: JSON loader específico
-
-    return img;
-}
-
-double perpendicular_distance(const Point &pt, const Point &line_start, const Point &line_end)
-{
-    double dx = line_end.x - line_start.x;
-    double dy = line_end.y - line_start.y;
-    double mag = std::hypot(dx, dy);
-
-    if (mag == 0.0) {
-        return std::hypot(pt.x - line_start.x, pt.y - line_start.y);
-    }
-
-    // Distance from the point to the line defined by line_start and line_end
-    return (std::abs((line_end.y - line_start.y) * pt.x - (line_end.x - line_start.x)
-            * pt.y + line_end.x * line_start.y - line_end.y * line_start.x) / mag);
-}
-
-void rdp_recursive(const std::vector<Point> &points, std::size_t first,
-                   std::size_t last, double epsilon, std::vector<bool> &keep)
-{
-    if (first + 1 >= last) {
-        return;
-    }
-
-    double max_dist = 0.0;
-    std::size_t index = first;
-
-    for (std::size_t i = first + 1; i < last; ++i) {
-        double dist = perpendicular_distance(points[i], points[first], points[last]);
-        if (dist > max_dist) {
-            max_dist = dist;
-            index = i;
+    std::string result(text.substr(0, 32));
+    for (char &c : result) {
+        if (c < 0x20 || c > 0x7e) {
+            c = '?';
         }
     }
+    return text.size() > 32 ? result + "..." : result;
+}
 
-    if (max_dist > epsilon) {
-        keep[index] = true;
-        rdp_recursive(points, first, index, epsilon, keep);
-        rdp_recursive(points, index, last, epsilon, keep);
+// Minimal JSON reader. Parse errors are thrown and turned into a Result by load_json().
+struct JsonReader {
+    std::string_view text;
+    std::size_t pos = 0;
+
+    [[noreturn]] void fail(const std::string &message) const
+    {
+        throw std::runtime_error(std::format("invalid JSON at offset {}: {}", pos, message));
+    }
+
+    // Skips whitespace and returns the next character ('\0' at the end of the text).
+    auto peek() -> char
+    {
+        while (pos < text.size() && std::string_view(" \t\r\n").contains(text[pos])) {
+            ++pos;
+        }
+        return pos < text.size() ? text[pos] : '\0';
+    }
+
+    void expect(char c)
+    {
+        if (peek() != c) {
+            fail(std::format("expected '{}'", c));
+        }
+        ++pos;
+    }
+
+    auto consume(char c) -> bool
+    {
+        if (peek() != c) {
+            return false;
+        }
+        ++pos;
+        return true;
+    }
+
+    // Object keys only: escape sequences are not supported.
+    auto key() -> std::string_view
+    {
+        expect('"');
+        const std::size_t end = text.find('"', pos);
+        if (end == std::string_view::npos) {
+            fail("unterminated string");
+        }
+        const std::string_view result = text.substr(pos, end - pos);
+        if (result.contains('\\')) {
+            fail("escape sequences are not supported");
+        }
+        pos = end + 1;
+        return result;
+    }
+
+    auto integer() -> int
+    {
+        peek();
+        const char *begin = text.data() + pos;
+        const char *end = text.data() + text.size();
+        int value = 0;
+        const auto [ptr, ec] = std::from_chars(begin, end, value);
+        if (ec != std::errc{} || (ptr != end && std::string_view(".eE").contains(*ptr))) {
+            fail("expected an integer");
+        }
+        pos += static_cast<std::size_t>(ptr - begin);
+        return value;
+    }
+
+    template <typename F>
+    void object(F &&on_key) // on_key(key) must consume the value
+    {
+        expect('{');
+        if (consume('}')) {
+            return;
+        }
+        do {
+            const std::string_view name = key();
+            expect(':');
+            on_key(name);
+        } while (consume(','));
+        expect('}');
+    }
+
+    template <typename F>
+    void array(F &&on_item)
+    {
+        expect('[');
+        if (consume(']')) {
+            return;
+        }
+        do {
+            on_item();
+        } while (consume(','));
+        expect(']');
+    }
+};
+
+// Schema-specific and strict (unknown keys are errors). The nesting depth is fixed by the
+// schema, so hostile input cannot overflow the stack.
+auto parse_drawing(std::string_view text) -> Drawing
+{
+    JsonReader json{text};
+    Drawing drawing;
+    bool has_edges = false;
+
+    json.object([&](std::string_view key) {
+        if (key == "width") {
+            drawing.width = json.integer();
+        }
+        else if (key == "height") {
+            drawing.height = json.integer();
+        }
+        else if (key == "edges") {
+            has_edges = true;
+            json.array([&] {
+                Contour &contour = drawing.contours.emplace_back();
+                json.object([&](std::string_view field) {
+                    if (field == "id") {
+                        contour.id = json.integer();
+                    }
+                    else if (field == "points") {
+                        json.array([&] {
+                            Point point{-1, -1}; // stays out of range if x or y is missing
+                            json.object([&](std::string_view axis) {
+                                if (axis == "x") {
+                                    point.x = json.integer();
+                                }
+                                else if (axis == "y") {
+                                    point.y = json.integer();
+                                }
+                                else {
+                                    json.fail(std::format("unexpected key '{}' in point", printable(axis)));
+                                }
+                            });
+                            contour.points.push_back(point);
+                        });
+                    }
+                    else {
+                        json.fail(std::format("unexpected key '{}' in edge", printable(field)));
+                    }
+                });
+            });
+        }
+        else {
+            json.fail(std::format("unexpected key '{}'", printable(key)));
+        }
+    });
+
+    if (json.peek() != '\0') {
+        json.fail("unexpected data after the top-level object");
+    }
+    if (drawing.width <= 0 || drawing.height <= 0) {
+        throw std::runtime_error("'width' and 'height' are required and must be positive");
+    }
+    if (!has_edges) {
+        throw std::runtime_error("'edges' is required");
+    }
+    for (const Contour &contour : drawing.contours) {
+        for (const Point &p : contour.points) {
+            if (p.x < 0 || p.x >= drawing.width || p.y < 0 || p.y >= drawing.height) {
+                throw std::runtime_error(std::format("contour {}: point ({}, {}) is missing or outside the {}x{} image",
+                                                     contour.id, p.x, p.y, drawing.width, drawing.height));
+            }
+        }
+    }
+    return drawing;
+}
+
+auto read_file(const fs::path &path) -> Result<std::string>
+{
+    std::error_code ec;
+    const auto size = fs::file_size(path, ec); // also fails for directories
+    if (ec) {
+        return std::unexpected(std::format("cannot stat '{}': {}", path.string(), ec.message()));
+    }
+    if (size > MAX_FILE_BYTES) {
+        return std::unexpected(std::format("file too large: {} bytes (max {})", size, MAX_FILE_BYTES));
+    }
+
+    std::string content(size, '\0');
+    std::ifstream file(path, std::ios::binary);
+    if (!file.read(content.data(), static_cast<std::streamsize>(size))) {
+        return std::unexpected(std::format("cannot read '{}'", path.string()));
+    }
+    return content;
+}
+
+auto load_json(const fs::path &path) -> Result<Drawing>
+{
+    const auto content = read_file(path);
+    if (!content) {
+        return std::unexpected(content.error());
+    }
+    try {
+        return parse_drawing(*content);
+    }
+    catch (const std::exception &error) {
+        return std::unexpected(error.what());
     }
 }
 
-auto ramer_douglas_peucker(const std::vector<Point> &points, double epsilon) -> std::vector<Point>
+// Ramer-Douglas-Peucker
+
+auto distance_to_line(const Point &p, const Point &a, const Point &b) -> double
+{
+    const double dx = b.x - a.x;
+    const double dy = b.y - a.y;
+    const double length = std::hypot(dx, dy);
+
+    if (length == 0.0) { // a == b (closed contour): distance to the point
+        return std::hypot(p.x - a.x, p.y - a.y);
+    }
+    return std::abs(dx * (p.y - a.y) - dy * (p.x - a.x)) / length;
+}
+
+auto simplify(const std::vector<Point> &points, double epsilon) -> std::vector<Point>
 {
     if (points.size() < 3) {
         return points;
     }
 
     std::vector<bool> keep(points.size(), false);
-    keep[0] = true;
+    keep.front() = true;
     keep.back() = true;
 
-    rdp_recursive(points, 0, points.size() - 1, epsilon, keep);
+    // Explicit stack instead of recursion: long contours cannot overflow the call stack.
+    std::vector<std::pair<std::size_t, std::size_t>> pending{{0, points.size() - 1}};
+    while (!pending.empty()) {
+        const auto [first, last] = pending.back();
+        pending.pop_back();
 
-    std::vector<Point> simplified;
-    simplified.reserve(points.size());
+        double max_dist = epsilon; // only points farther than epsilon split the range
+        std::size_t split = 0;     // 0 = none (a split index is always > first >= 0)
+        for (std::size_t i = first + 1; i < last; ++i) {
+            const double dist = distance_to_line(points[i], points[first], points[last]);
+            if (dist > max_dist) {
+                max_dist = dist;
+                split = i;
+            }
+        }
+        if (split != 0) {
+            keep[split] = true;
+            pending.emplace_back(first, split);
+            pending.emplace_back(split, last);
+        }
+    }
+
+    std::vector<Point> result;
     for (std::size_t i = 0; i < points.size(); ++i) {
         if (keep[i]) {
-            simplified.push_back(points[i]);
+            result.push_back(points[i]);
         }
     }
-    return simplified;
+    return result;
 }
 
-auto write_svg(const std::filesystem::path &path, int width, int height,
-               const std::vector<Contour> &contours, double epsilon) -> Result<void>
+// SVG output
+
+struct Svg {
+    std::string text;
+    std::size_t points_in = 0;
+    std::size_t points_out = 0;
+};
+
+auto render_svg(const Drawing &drawing, double epsilon) -> Svg
 {
-    std::ofstream file(path);
-    if (!file.is_open()) {
-        return std::unexpected(std::format("failed to create output svg file '{}'", path.string()));
-    }
+    Svg svg;
+    svg.text = std::format("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{0}\" height=\"{1}\" viewBox=\"0 0 {0} {1}\">\n"
+                           "  <style>\n"
+                           "    .contour {{ fill: none; stroke: #2c3e50; stroke-width: 1.5px; }}\n"
+                           "  </style>\n"
+                           "  <rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>\n",
+                           drawing.width, drawing.height);
 
-    file << std::format("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"0 0 {} {}\">\n",
-                        width, height, width, height);
-    file << "  <style>\n";
-    file << "    .contour { fill: none; stroke: #2c3e50; stroke-width: 1.5px; }\n";
-    file << "  </style>\n";
-    file << "  <rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>\n";
-
-    for (const auto &contour : contours) {
-        auto simplified = ramer_douglas_peucker(contour.points, epsilon);
-        if (simplified.empty()) {
+    for (const Contour &contour : drawing.contours) {
+        if (contour.points.empty()) {
             continue;
         }
+        svg.points_in += contour.points.size();
 
-        file << "  <path class=\"contour\" d=\"M " << simplified[0].x << " " << simplified[0].y;
-        for (std::size_t i = 1; i < simplified.size(); ++i) {
-            file << " L " << simplified[i].x << " " << simplified[i].y;
+        // A contour is closed when its ends touch (8-neighbours). RDP then needs the start
+        // repeated at the end, so the loop is split at the point farthest from the start.
+        std::vector<Point> points = contour.points;
+        const Point head = points.front();
+        const Point tail = points.back();
+        const bool closed = points.size() >= 3 && std::abs(head.x - tail.x) <= 1 && std::abs(head.y - tail.y) <= 1;
+        if (closed) {
+            points.push_back(head);
         }
-        file << " Z\" />\n";
+        points = simplify(points, epsilon);
+        if (closed) {
+            points.pop_back();
+        }
+        if (points.size() < 2) { // nothing visible to draw
+            continue;
+        }
+        svg.points_out += points.size();
+
+        svg.text += std::format("  <path class=\"contour\" data-id=\"{}\" d=\"", contour.id);
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            std::format_to(std::back_inserter(svg.text), "{}{} {}", i == 0 ? "M " : " L ",
+                           points[i].x + 0.5, points[i].y + 0.5);
+        }
+        svg.text += closed ? " Z\"/>\n" : "\"/>\n";
     }
 
-    file << "</svg>\n";
+    svg.text += "</svg>\n";
+    return svg;
+}
+
+// Writes to "<path>.tmp" and renames on success, so a failure never leaves a partial file.
+auto write_file(const fs::path &path, std::string_view content) -> Result<void>
+{
+    fs::path tmp = path;
+    tmp += ".tmp";
+    std::error_code ec;
+
+    const auto fail = [&](std::string message) {
+        fs::remove(tmp, ec);
+        return std::unexpected(std::move(message));
+    };
+
+    if (path.has_parent_path()) {
+        fs::create_directories(path.parent_path(), ec);
+        if (ec) {
+            return fail(std::format("cannot create directory '{}': {}", path.parent_path().string(), ec.message()));
+        }
+    }
+
+    std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        return fail(std::format("cannot open '{}' for writing", tmp.string()));
+    }
+    file.write(content.data(), static_cast<std::streamsize>(content.size()));
+    file.close();
+    if (!file) {
+        return fail("failed while writing SVG (disk full?)");
+    }
+
+    fs::rename(tmp, path, ec);
+    if (ec) {
+        return fail(std::format("cannot move result to '{}': {}", path.string(), ec.message()));
+    }
     return {};
 }
 
 } // namespace
 
-auto main(int argc, char** argv) -> int {
-
+auto main(int argc, char **argv) -> int
+{
     const std::span<const char *const> args(argv, static_cast<std::size_t>(argc));
-    const auto cli = args.empty() ? args : args.subspan(1);
-
-    const auto opts = parse_args(cli);
+    const auto opts = parse_args(args.empty() ? args : args.subspan(1));
     if (!opts) {
-        std::println(stderr, "Error: {}\n", opts.error());
-        usage();
+        std::println(stderr, "Error: {}", opts.error());
+        usage(stderr);
         return 2;
     }
     if (opts->help) {
-        usage();
+        usage(stdout);
         return 0;
     }
 
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(opts->input, ec)) {
-        std::println(stderr, "Error: input file not found: '{}'", opts->input.string());
+    const auto drawing = load_json(opts->input);
+    if (!drawing) {
+        std::println(stderr, "Error loading JSON '{}': {}", opts->input.filename().string(), drawing.error());
         return 1;
     }
+    std::println("JSON loaded: {}\nWidth: {}\nHeight: {}\nContours: {}",
+                 opts->input.string(), drawing->width, drawing->height, drawing->contours.size());
 
-    std::filesystem::path output = opts->output;
-    if (!validate_extension(output, ".svg")) {
+    // Missing ".svg" extension is appended.
+    fs::path output = opts->output;
+    std::string ext = output.extension().string();
+    std::ranges::transform(ext, ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (ext != ".svg") {
         output += ".svg";
     }
 
-    if (const std::filesystem::path dir = output.parent_path(); !dir.empty()) {
-        if (std::filesystem::create_directories(dir, ec)) {
-            std::println("Directory created: '{}'", dir.string());
-        }
-        else if (ec) {
-            std::println(stderr, "Error creating directory '{}': {}", dir.string(), ec.message());
-            return 1;
-        }
+    const Svg svg = render_svg(*drawing, opts->epsilon);
+    if (const auto written = write_file(output, svg.text); !written) {
+        std::println(stderr, "Error saving SVG: {}", written.error());
+        return 1;
     }
 
-    // TODO - Executar Sequência
-    // TODO: ler json_path e popular largura, altura e vector<Contour>
-    // TODO: para cada Contour, aplicar Ramer-Douglas-Peucker (epsilon
-    //       configuravel) para reduzir o numero de pontos.
-    // TODO: montar o path SVG usando apenas comandos M (move) e L (line),
-    //       sem C/Q (Bezier) -- decisao de escopo do projeto.
-    // TODO: escrever o arquivo SVG final em svg_path.
-
+    std::println("Points: {} -> {} (epsilon {})", svg.points_in, svg.points_out, opts->epsilon);
+    std::println("SVG successfully generated at: {}", output.string());
     return 0;
 }
