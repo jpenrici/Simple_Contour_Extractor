@@ -9,7 +9,7 @@
  * Input:  PNG image
  * Output: CSV file, one line per pixel row, values 0-255
  *
- * Requires: stb_image.h
+ * Requires: stb_image.h (image loader)
  *
  * Exit codes: 0 = OK, 1 = runtime error, 2 = usage error.
  *
@@ -38,6 +38,7 @@
 
 // stb_image is meant for trusted data; for anything else its docs advise lowering this limit
 // so absurd dimensions are rejected during header parsing, before any allocation.
+// See more: https://github.com/nothings/stb/blob/master/stb_image.h
 #define STBI_MAX_DIMENSIONS (1 << 16)
 #define STBI_ONLY_PNG
 #define STBI_FAILURE_USERMSG
@@ -48,16 +49,17 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// Modern error handling. Avoids excessive use of try/catch.
 template <typename T>
-using Result = std::expected<T, std::string>;
+using Result = std::expected<T, std::string>; // <type, message upon failure>
 
 constexpr std::uint64_t DEFAULT_MAX_PIXELS = 16ULL * 1024 * 1024;
 constexpr std::uintmax_t MAX_FILE_BYTES = 256ULL * 1024 * 1024;
 static_assert(MAX_FILE_BYTES <= std::numeric_limits<int>::max(), "stb_image takes the buffer size as int");
 
 struct Options {
-    fs::path input;
-    fs::path output;
+    fs::path input;     // full path to the original image, including name and extension
+    fs::path output;    // full path to the CSV file
     std::uint64_t max_pixels = DEFAULT_MAX_PIXELS;
     bool help = false;
 };
@@ -124,6 +126,8 @@ auto parse_args(std::span<const char *const> args) -> Result<Options>
     return opts;
 }
 
+// Ensures that the image memory is automatically
+// and safely released as soon as the pointer goes out of scope, preventing memory leaks.
 using StbiPtr = std::unique_ptr < stbi_uc, decltype([](void *p)
 {
     stbi_image_free(p);
@@ -136,6 +140,19 @@ struct GrayImage {
     std::size_t height = 0;
     int source_channels = 0;
 
+    /**
+    * @brief Gets a safe view (span) of a specific row of the image.
+    *
+    * This function allows access to the pixels of a horizontal row of the image
+    * without exposing raw pointers or allowing unsafe memory manipulation.
+    * The returned span is read-only (`const`).
+    *
+    * @param y The index of the desired row (zero-based, where 0 is the first row).
+    * @return std::span<const stbi_uc> A contiguous view of the pixels belonging to row `y`.
+    *
+    * @warning The index `y` must be within the image boundaries (`0 <= y < height`);
+    *          otherwise, behavior is undefined (or a bounds violation will occur, depending on span usage).
+    */
     [[nodiscard]] auto row(std::size_t y) const -> std::span<const stbi_uc>
     {
         return std::span<const stbi_uc>(data.get(), width * height).subspan(y * width, width);
@@ -160,6 +177,7 @@ auto read_file(const fs::path &path) -> Result<std::vector<stbi_uc>>
         return std::unexpected(std::format("invalid file size: {} bytes (max {})", size, MAX_FILE_BYTES));
     }
 
+    // stbi_uc = unsigned char
     std::vector<stbi_uc> bytes(size);
     std::ifstream file(path, std::ios::binary);
     if (!file.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(size))) {
@@ -170,6 +188,7 @@ auto read_file(const fs::path &path) -> Result<std::vector<stbi_uc>>
 
 auto load_gray(const fs::path &path, std::uint64_t max_pixels) -> Result<GrayImage>
 {
+    // Loads raw image data
     const auto bytes = read_file(path);
     if (!bytes) {
         return std::unexpected(bytes.error());
@@ -187,7 +206,13 @@ auto load_gray(const fs::path &path, std::uint64_t max_pixels) -> Result<GrayIma
                                            w, h, pixel_count, max_pixels));
     }
 
-    GrayImage img{StbiPtr(stbi_load_from_memory(bytes->data(), len, &w, &h, &channels, STBI_grey))};
+    GrayImage img{
+        /* Stores data in a smart pointer */
+        StbiPtr(
+            /* Loads raw data from an `stbi_uc` vector, converting it to grayscale. */
+            stbi_load_from_memory(bytes->data(), len, &w, &h, &channels, STBI_grey)
+        )
+    };
     if (!img.data) {
         return std::unexpected(stb_error());
     }
@@ -216,6 +241,7 @@ auto write_csv(const fs::path &path, const GrayImage &img) -> Result<void>
         }
     }
 
+    // Save CSV
     std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
     if (!file) {
         return fail(std::format("cannot open '{}' for writing", tmp.string()));
@@ -248,6 +274,7 @@ auto write_csv(const fs::path &path, const GrayImage &img) -> Result<void>
 
 auto main(int argc, char **argv) -> int
 {
+    // Args
     const std::span<const char *const> args(argv, static_cast<std::size_t>(argc));
     const auto opts = parse_args(args.empty() ? args : args.subspan(1));
     if (!opts) {
@@ -260,6 +287,7 @@ auto main(int argc, char **argv) -> int
         return 0;
     }
 
+    // Image Input
     const auto image = load_gray(opts->input, opts->max_pixels);
     if (!image) {
         std::println(stderr, "Error loading image '{}': {}", opts->input.filename().string(), image.error());
@@ -268,9 +296,10 @@ auto main(int argc, char **argv) -> int
     std::println("Image loaded: {}\nWidth: {}\nHeight: {}\nChannels: {}",
                  opts->input.string(), image->width, image->height, image->source_channels);
 
-    // Missing ".csv" extension is appended.
+    // CSV Output
     fs::path output = opts->output;
     std::string ext = output.extension().string();
+    // Missing ".csv" extension is appended.
     std::ranges::transform(ext, ext.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });
