@@ -7,7 +7,7 @@ Pipeline:
     Imagem PNG
       -> (C++, stb_image)      grayscale matrix -> CSV
       -> (Fortran, Canny)      ordered contours -> JSON (custom schema)
-      -> (C++, RDP + path "L") Final SVG (without Bézier curves)
+      -> (C++, RDP + path "L") final SVG (without Bézier curves)
 
 ## Requirements
 
@@ -24,11 +24,11 @@ Pipeline:
 
 ## Run the pipeline
 
-    python3 run.py --input path/to/image.png [--epsilon N] [--name NAME] [--no-overlay] # real image (external)
+    python3 run.py --input path/to/image.png [--epsilon N] [--name NAME] [--no-overlay] # real image
     python3 run.py [--width N] [--height N] [--noise N] [--seed N] [--epsilon N] # test image
     python3 run.py --help # to observe details
     
     Example:
     
-        python3 run.py --input images/sample.png --name Sample  # processes the pipeline for the image sample.png
-        python3 run.py # generates a test image and processes the pipeline
+        python3 run.py --input images/sample.png --name Sample
+        python3 run.py
